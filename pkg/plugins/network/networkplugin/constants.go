@@ -6,6 +6,8 @@ const DAY_OF_MONTH_31st = 31
 // PROMETHEUS
 const PROMETHEUS_LABEL_SRC_ZONE = "SrcK8S_Zone"
 const PROMETHEUS_LABEL_DST_ZONE = "DstK8S_Zone"
+const PROMETHEUS_LABEL_SRC_OWNER_NAME = "SrcK8S_OwnerName"
+const PROMETHEUS_LABEL_SRC_OWNER_TYPE = "SrcK8S_OwnerType"
 
 const QUERY_WORKLOAD_INGRESS_BYTES_TOTAL = "increase(netobserv_workload_ingress_bytes_total[%s])"
 const QUERY_WORKLOAD_EGRESS_BYTES_TOTAL = "increase(netobserv_workload_egress_bytes_total[%s])"

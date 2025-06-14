@@ -2,9 +2,9 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/opencost/opencost-plugins/pkg/plugins/network/networkplugin"
 	"github.com/opencost/opencost/core/pkg/log"
@@ -47,25 +47,12 @@ func getNetworkCostClients(config networkplugin.NetworkConfig) (prometheusApiV1.
 	return prometheusApiV1Client, clientset, nil
 }
 
-func getBillingPeriodStartDate(queryStartDate time.Time, billingPeriodStartDate int) time.Time {
-	date := queryStartDate
-	dayDifference := billingPeriodStartDate - queryStartDate.Day()
-
-	// if the billing start date is smaller than the current one, the billing period starts in the current month
-	if dayDifference < 0 {
-		date = date.AddDate(0, 0, dayDifference)
-	}
-
-	// if the billing start date is larger than the current one, the billing period starts in the previous month
-	if dayDifference > 0 {
-		date = date.AddDate(0, -1, dayDifference)
-	}
-
-	return date
+func convertBytesToGB(bytes int64) float64 {
+	return float64(bytes) / math.Pow(1024, 3)
 }
 
 func generateErrorResponse(msg string, err error, results []*pb.CustomCostResponse) []*pb.CustomCostResponse {
-	errMsg := fmt.Sprintf("%s:%v", msg, err)
+	errMsg := fmt.Sprintf("%s: %v", msg, err)
 
 	log.Error(errMsg)
 	errResponse := pb.CustomCostResponse{
