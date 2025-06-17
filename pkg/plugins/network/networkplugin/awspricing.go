@@ -32,3 +32,8 @@ type PriceDimension struct {
 type PricePerUnit struct {
 	USD string `json:"USD"`
 }
+
+type BilledUsage struct {
+	UsageQuantityGB float32
+	BilledCost      float32
+}

@@ -25,9 +25,11 @@ func (s *NetworkCostSource) getSumOfInterZoneDataSinceBillingPeriodStart(req *pb
 
 	// query the Prometheus API for workload inter-zone bytes within the given range
 	results, err := s.queryPrometheusData(query, start, end, step)
-	bytesSum := getInterZoneBytesSumFromPrometheusResults(results)
+	if err != nil {
+		return 0, err
+	}
 
-	return bytesSum, nil
+	return getInterZoneBytesSumFromPrometheusResults(results), nil
 }
 
 func (s *NetworkCostSource) queryPrometheusData(query string, start time.Time, end time.Time, step time.Duration) (model.Value, error) {

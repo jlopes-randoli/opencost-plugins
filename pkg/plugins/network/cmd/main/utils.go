@@ -51,6 +51,10 @@ func convertBytesToGB(bytes int64) float64 {
 	return float64(bytes) / math.Pow(1024, 3)
 }
 
+func convertGBToBytes(gb float64) int64 {
+	return int64(math.Round(gb * math.Pow(1024, 3)))
+}
+
 func generateErrorResponse(msg string, err error, results []*pb.CustomCostResponse) []*pb.CustomCostResponse {
 	errMsg := fmt.Sprintf("%s: %v", msg, err)
 

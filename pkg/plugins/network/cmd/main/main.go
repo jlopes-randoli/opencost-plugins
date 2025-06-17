@@ -22,8 +22,13 @@ type NetworkCostSource struct {
 }
 
 func (s *NetworkCostSource) GetCustomCosts(req *pb.CustomCostRequest) []*pb.CustomCostResponse {
-	// get provider based on cluster vendor
+	// get and initialize provider based on cluster vendor
 	provider := getProvider()
+	err := provider.Init(s)
+	if err != nil {
+		results := []*pb.CustomCostResponse{}
+		return generateErrorResponse("failed to initialize provider", err, results)
+	}
 
 	// get region from node labels
 	region, err := s.getRegionFromNodeLabels()

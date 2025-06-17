@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"time"
@@ -153,7 +154,7 @@ func (p *AwsProvider) getInterZoneCostsForWindow(window opencost.Window, src *Ne
 		}
 
 		// create total sum of billed data to check against the pricing tier range
-		totalBilledSum := ingressBytesSum + egressBytesSum
+		totalBilledBytesSum := ingressBytesSum + egressBytesSum
 
 		// query inter-zone data transfer to calculate cost for window
 		ingressQueryResults, err := src.queryPrometheusData(networkplugin.QUERY_WORKLOAD_INGRESS_BYTES_TOTAL, *window.Start(), *window.End(), window.Duration())
@@ -166,16 +167,13 @@ func (p *AwsProvider) getInterZoneCostsForWindow(window opencost.Window, src *Ne
 			return nil, fmt.Errorf("failed to query inter-zone egress data transfer for given window: %v", err)
 		}
 
-		// we are manually tracking the current pricing tier index
-		priceDimensionIndex := 0
-
 		// calculate and return ingress & egress inter-zone costs
-		ingressCosts, totalBilledSum, priceDimensionIndex, err := calculateAwsInterZoneCosts("Ingress Inter Zone", ingressQueryResults.(model.Matrix), priceDimensions, totalBilledSum, priceDimensionIndex)
+		ingressCosts, totalBilledBytesSum, err := calculateAwsInterZoneCosts("Ingress Inter Zone", ingressQueryResults.(model.Matrix), priceDimensions, totalBilledBytesSum)
 		if err != nil {
 			return nil, fmt.Errorf("failed to calculate inter-zone ingress data cost for given window: %v", err)
 		}
 
-		egressCosts, totalBilledSum, priceDimensionIndex, err := calculateAwsInterZoneCosts("Ingress Inter Zone", egressQueryResults.(model.Matrix), priceDimensions, totalBilledSum, priceDimensionIndex)
+		egressCosts, _, err := calculateAwsInterZoneCosts("Egress Inter Zone", egressQueryResults.(model.Matrix), priceDimensions, totalBilledBytesSum)
 		if err != nil {
 			return nil, fmt.Errorf("failed to calculate inter-zone egress data cost for given window: %v", err)
 		}
@@ -194,9 +192,8 @@ func calculateAwsInterZoneCosts(
 	resourceName string,
 	resultsMatrix model.Matrix,
 	priceDimensions []networkplugin.PriceDimension,
-	totalBilledSum int64,
-	priceDimensionIndex int,
-) (costs []*pb.CustomCost, updatedTotalBilledSum int64, updatedPriceDimensionIndex int, err error) {
+	totalBilledUsageBytes int64,
+) (costs []*pb.CustomCost, updatedTotalBilledUsageBytes int64, err error) {
 	// create a map to store costs by workload
 	workloadCostMap := make(map[networkplugin.Workload]*pb.CustomCost)
 
@@ -213,37 +210,6 @@ func calculateAwsInterZoneCosts(
 			continue
 		}
 
-		// check if we are at the correct pricing tier before calculating cost
-		currentPriceDimension := priceDimensions[priceDimensionIndex]
-		isCorrectDimension := false
-
-		for isCorrectDimension == false {
-			// if pricing dimension end range is 'INF', then this is the final pricing tier
-			// if it is not 'INF', we need to check the current sum to make sure we are in the correct pricing tier
-			if currentPriceDimension.EndRange == "Inf" {
-				isCorrectDimension = true
-			} else {
-				endRange, err := strconv.ParseFloat(currentPriceDimension.EndRange, 64)
-				if err != nil {
-					return nil, 0, 0, fmt.Errorf("failed to parse float from price dimension end range: %v", err)
-				}
-
-				// if previously billed data for this billing period exceeds the current pricing tier, move to the next one
-				// otherwise, this is the correct pricing tier
-				if convertBytesToGB(totalBilledSum) >= endRange {
-					if isIndexValidForPriceDimensionArray(priceDimensionIndex+1, priceDimensions) {
-						priceDimensionIndex++
-						currentPriceDimension = priceDimensions[priceDimensionIndex]
-					} else {
-						// if the index can not be incremented any further, we need to exit the loop
-						isCorrectDimension = true
-					}
-				} else {
-					isCorrectDimension = true
-				}
-			}
-		}
-
 		// if the data transferred between two different zones, we need to bill this data
 		if srcZone != dstZone {
 			for i, val := range stream.Values {
@@ -251,22 +217,6 @@ func calculateAwsInterZoneCosts(
 					log.Warnf("prometheus query returned data for additional step when only 1 was expected: %v", val)
 					continue
 				}
-
-				// TODO: check for edge-case where value goes over to next pricing dimension
-
-				// calculate inter-zone cost
-				billedQuantity := convertBytesToGB(int64(val.Value))
-				pricePerUnit, err := strconv.ParseFloat(currentPriceDimension.PricePerUnit.USD, 64)
-				if err != nil {
-					log.Errorf("failed to parse float from price dimension price per unit: %v", err)
-					break
-				}
-
-				billedCost := pricePerUnit * billedQuantity
-
-				// convert cost and quantity to float32 to match response format
-				convertedBilledCost := float32(billedCost)
-				convertedBilledQuantity := float32(billedQuantity)
 
 				// get source owner name and type to map cost to workload
 				srcOwnerName, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_SRC_OWNER_NAME]
@@ -279,6 +229,21 @@ func calculateAwsInterZoneCosts(
 					log.Warnf("prometheus data is missing label: %s", networkplugin.PROMETHEUS_LABEL_SRC_OWNER_NAME)
 				}
 
+				// calculate inter-zone cost for each relevant pricing dimension
+				usagePendingBilling := int64(val.Value)
+				billedUsageByDimension, updatedTotalBilledUsageBytes, err := calculateBilledUsageAcrossPricingDimensions(
+					totalBilledUsageBytes,
+					usagePendingBilling,
+					priceDimensions,
+				)
+				if err != nil {
+					log.Errorf("failed to calculate AWS inter-zone cost for workload %v/%v: %v", err, srcOwnerType, srcOwnerName)
+					break
+				}
+
+				// after cost calculation, the total billed amount must be updated as well
+				totalBilledUsageBytes = updatedTotalBilledUsageBytes
+
 				// if workload already exists in map, add to existing workload cost
 				// otherwise, create new cost associated with workload
 				workload := networkplugin.Workload{
@@ -286,18 +251,18 @@ func calculateAwsInterZoneCosts(
 					Type: string(srcOwnerType),
 				}
 
-				workloadCost, costExists := workloadCostMap[workload]
-				if !costExists {
-					workloadCostMap[workload] = createAwsCustomCost(convertedBilledCost, convertedBilledQuantity, resourceName)
-				} else {
-					workloadCost.BilledCost += convertedBilledCost
-					workloadCost.UsageQuantity += convertedBilledQuantity
+				// loop through the array of billed usage by dimension and update the workload's billed cost and usage quantity
+				for _, billedUsage := range billedUsageByDimension {
+					workloadCost, costExists := workloadCostMap[workload]
+					if !costExists {
+						workloadCostMap[workload] = createAwsCustomCost(billedUsage.BilledCost, billedUsage.UsageQuantityGB, resourceName)
+					} else {
+						workloadCost.BilledCost += billedUsage.BilledCost
+						workloadCost.UsageQuantity += billedUsage.UsageQuantityGB
 
-					workloadCostMap[workload] = workloadCost
+						workloadCostMap[workload] = workloadCost
+					}
 				}
-
-				// add billed quantity to total billed sum
-				totalBilledSum += int64(val.Value)
 			}
 		}
 	}
@@ -308,10 +273,68 @@ func calculateAwsInterZoneCosts(
 		workloadCostArray = append(workloadCostArray, cost)
 	}
 
-	return workloadCostArray, totalBilledSum, priceDimensionIndex, nil
+	return workloadCostArray, totalBilledUsageBytes, nil
 }
 
-func createAwsCustomCost(billedCost float32, billedQuantity float32, resourceName string) *pb.CustomCost {
+func calculateBilledUsageAcrossPricingDimensions(
+	totalBilledUsageBytes int64,
+	usagePendingBillingBytes int64,
+	priceDimensions []networkplugin.PriceDimension,
+) (billedUsageByDimension []networkplugin.BilledUsage, updatedTotalBilledUsageBytes int64, err error) {
+	billedUsageArray := []networkplugin.BilledUsage{}
+
+	// loop through each pricing dimension and bill usage to the correct tier
+	for i := 0; i < len(priceDimensions) && usagePendingBillingBytes > 0; i++ {
+		priceDimension := priceDimensions[i]
+
+		// get the current end range to check if we are in the correct tier before billing
+		var endRangeGB float64
+		if priceDimension.EndRange == "Inf" {
+			endRangeGB = math.Inf(1)
+		} else {
+			endRangeGB, err = strconv.ParseFloat(priceDimension.EndRange, 64)
+			if err != nil {
+				return nil, totalBilledUsageBytes, fmt.Errorf("failed to parse end range: %v", err)
+			}
+		}
+
+		// if the current total billed amount has passed the end range, skip this tier
+		totalBilledUsageGB := convertBytesToGB(totalBilledUsageBytes)
+		if totalBilledUsageGB >= endRangeGB {
+			continue
+		}
+
+		// get price per unit from current pricing dimension to begin billed amount calculations
+		pricePerUnit, err := strconv.ParseFloat(priceDimension.PricePerUnit.USD, 64)
+		if err != nil {
+			return nil, totalBilledUsageBytes, fmt.Errorf("failed to parse price per unit: %v", err)
+		}
+
+		// determine amount to be billed based on current tier
+		// if pending amount exceeds the end range of the current tier, only bill the remaining amount at this tier
+		usagePendingBillingGB := convertBytesToGB(usagePendingBillingBytes)
+		maxUsageForCurrentTierGB := endRangeGB - totalBilledUsageGB
+		billedUsageGB := math.Min(usagePendingBillingGB, maxUsageForCurrentTierGB)
+
+		// calculate billed amount for current tier and add to response array
+		billedUsageForTier := networkplugin.BilledUsage{
+			UsageQuantityGB: float32(billedUsageGB),
+			BilledCost:      float32(billedUsageGB * pricePerUnit),
+		}
+
+		billedUsageArray = append(billedUsageArray, billedUsageForTier)
+
+		// convert billed amount back to bytes
+		// then, we update the total billed amount and subtract it from the pending bytes amount
+		billedUsageBytes := convertGBToBytes(billedUsageGB)
+		totalBilledUsageBytes += billedUsageBytes
+		usagePendingBillingBytes -= billedUsageBytes
+	}
+
+	return billedUsageArray, totalBilledUsageBytes, nil
+}
+
+func createAwsCustomCost(billedCost float32, usageQuantity float32, resourceName string) *pb.CustomCost {
 	return &pb.CustomCost{
 		BilledCost:     billedCost,
 		ChargeCategory: "Usage",
@@ -319,7 +342,7 @@ func createAwsCustomCost(billedCost float32, billedQuantity float32, resourceNam
 		Id:             uuid.New().String(),
 		ResourceName:   resourceName,
 		ResourceType:   "Network",
-		UsageQuantity:  billedQuantity,
+		UsageQuantity:  usageQuantity,
 
 		// TODO: figure out values
 		// AccountName:    billingEntry.OrganizationName,
@@ -355,8 +378,4 @@ func getAwsRegionalUsageTypeFromRegion(region string) string {
 	default:
 		return networkplugin.AWS_USAGE_TYPE_REGIONAL_US_EAST_1
 	}
-}
-
-func isIndexValidForPriceDimensionArray(index int, slice []networkplugin.PriceDimension) bool {
-	return (index >= 0 && index < len(slice))
 }
