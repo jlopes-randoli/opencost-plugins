@@ -72,7 +72,7 @@ func (p *AwsProvider) GetNetworkCost(src *NetworkCostSource, req *pb.CustomCostR
 		}
 
 		// calculate and append internet costs to response
-		internetCosts, err := p.getInternetCostsForWindow(window, src, req)
+		internetCosts, err := p.getInternetCostsForWindow(window, src, req, region)
 		if err != nil {
 			log.Errorf("error calculating AWS internet costs: %v", err)
 			response.Errors = append(response.Errors, err.Error())
@@ -112,33 +112,9 @@ func (p *AwsProvider) getInterZoneCostsForWindow(window opencost.Window, src *Ne
 	}
 
 	// loop through products that matched given filter and retrieve pricing data
-	var priceDimensions []networkplugin.PriceDimension
-	for _, interzonePricingJson := range interZoneProducts.PriceList {
-
-		// marshal pricing data JSON into a structure
-		var interzonePricingData networkplugin.ProductPrice
-		if err := json.Unmarshal([]byte(interzonePricingJson), &interzonePricingData); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal inter-zone network pricing entry: %v", err)
-		}
-
-		// navigate through pricing data structure to get price dimensions
-		for _, term := range interzonePricingData.Terms.OnDemand {
-			if len(priceDimensions) != 0 {
-				log.Warnf("unexpected inter-zone network pricing term found. skipping... term: %v", term)
-				continue
-			}
-
-			for _, dimension := range term.PriceDimensions {
-				priceDimensions = append(priceDimensions, dimension)
-			}
-		}
-
-		// sort price dimensions by range
-		sort.Slice(priceDimensions, func(i, j int) bool {
-			beginI, _ := strconv.Atoi(priceDimensions[i].BeginRange)
-			beginJ, _ := strconv.Atoi(priceDimensions[j].BeginRange)
-			return beginI < beginJ
-		})
+	priceDimensions, err := getSortedPriceDimensionsFromProducts(interZoneProducts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get price dimensions from products: %v", err)
 	}
 
 	if len(priceDimensions) > 0 {
@@ -184,99 +160,133 @@ func (p *AwsProvider) getInterZoneCostsForWindow(window opencost.Window, src *Ne
 	}
 }
 
-func (p *AwsProvider) getInternetCostsForWindow(window opencost.Window, src *NetworkCostSource, req *pb.CustomCostRequest) ([]*pb.CustomCost, error) {
+func (p *AwsProvider) getInternetCostsForWindow(window opencost.Window, src *NetworkCostSource, req *pb.CustomCostRequest, region string) ([]*pb.CustomCost, error) {
+	priceDimensions, err := p.getAwsInternetPriceDimensions(region)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get AWS internet price dimensions: %v", err)
+	}
+
+	if len(priceDimensions) > 0 {
+		// get sum of billed data since billing period start
+		internetEgressBytesSum, err := src.getSumOfInternetDataSinceBillingPeriodStart(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to calculate sum of internet egress data transfer since start of billing period: %v", err)
+		}
+
+		// query internet data transfer to calculate cost for window
+		internetEgressQueryResults, err := src.queryPrometheusData(networkplugin.QUERY_CLUSTER_EXTERNAL_EGRESS_BYTES_TOTAL, *window.Start(), *window.End(), window.Duration())
+		if err != nil {
+			return nil, fmt.Errorf("failed to query inter-zone ingress data transfer for given window: %v", err)
+		}
+
+		// calculate and return egress internet costs
+		ingressCosts, totalBilledBytesSum, err := calculateAwsInterZoneCosts("Ingress Inter Zone", ingressQueryResults.(model.Matrix), priceDimensions, totalBilledBytesSum)
+		if err != nil {
+			return nil, fmt.Errorf("failed to calculate inter-zone ingress data cost for given window: %v", err)
+		}
+
+	}
+
 	return nil, nil
 }
 
-func calculateAwsInterZoneCosts(
-	resourceName string,
-	resultsMatrix model.Matrix,
-	priceDimensions []networkplugin.PriceDimension,
-	totalBilledUsageBytes int64,
-) (costs []*pb.CustomCost, updatedTotalBilledUsageBytes int64, err error) {
-	// create a map to store costs by workload
-	workloadCostMap := make(map[networkplugin.Workload]*pb.CustomCost)
+func (p *AwsProvider) getAwsInternetPriceDimensions(region string) ([]networkplugin.PriceDimension, error) {
+	// currently the only region with API pricing available is sa-east-1
+	if region == networkplugin.AWS_REGION_SOUTH_AMERICA_EAST_1 {
 
-	// loop through data matrices and calculate the cost at the correct pricing tier
-	for _, stream := range resultsMatrix {
-		// if any labels are missing, we cannot evaluate this data and skip it
-		srcZone, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_SRC_ZONE]
-		if !ok {
-			continue
+		// create filter to get internet network pricing for this cluster
+		interZoneInput := &pricing.GetProductsInput{
+			ServiceCode: aws.String(networkplugin.AWS_SERVICE_CODE),
+			Filters: []types.Filter{
+				{
+					Field: aws.String("usagetype"),
+					Type:  types.FilterTypeTermMatch,
+					Value: aws.String(networkplugin.AWS_USAGE_TYPE_INTERNET_SOUTH_AMERICA_EAST_1),
+				},
+			},
+			FormatVersion: aws.String(networkplugin.AWS_FORMAT_VERSION),
+			MaxResults:    aws.Int32(1),
 		}
 
-		dstZone, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_DST_ZONE]
-		if !ok {
-			continue
+		// get list of filtered products for internet network pricing
+		internetProducts, err := p.client.GetProducts(context.TODO(), interZoneInput)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get AWS products related to internet network cost: %v", err)
 		}
 
-		// if the data transferred between two different zones, we need to bill this data
-		if srcZone != dstZone {
-			for i, val := range stream.Values {
-				if i > 0 {
-					log.Warnf("prometheus query returned data for additional step when only 1 was expected: %v", val)
-					continue
-				}
-
-				// get source owner name and type to map cost to workload
-				srcOwnerName, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_SRC_OWNER_NAME]
-				if !ok {
-					log.Warnf("prometheus data is missing label: %s", networkplugin.PROMETHEUS_LABEL_SRC_OWNER_NAME)
-				}
-
-				srcOwnerType, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_SRC_OWNER_TYPE]
-				if !ok {
-					log.Warnf("prometheus data is missing label: %s", networkplugin.PROMETHEUS_LABEL_SRC_OWNER_NAME)
-				}
-
-				// calculate inter-zone cost for each relevant pricing dimension
-				usagePendingBilling := int64(val.Value)
-				billedUsageByDimension, updatedTotalBilledUsageBytes, err := calculateBilledUsageAcrossPricingDimensions(
-					totalBilledUsageBytes,
-					usagePendingBilling,
-					priceDimensions,
-				)
-				if err != nil {
-					log.Errorf("failed to calculate AWS inter-zone cost for workload %v/%v: %v", err, srcOwnerType, srcOwnerName)
-					break
-				}
-
-				// after cost calculation, the total billed amount must be updated as well
-				totalBilledUsageBytes = updatedTotalBilledUsageBytes
-
-				// if workload already exists in map, add to existing workload cost
-				// otherwise, create new cost associated with workload
-				workload := networkplugin.Workload{
-					Name: string(srcOwnerName),
-					Type: string(srcOwnerType),
-				}
-
-				// loop through the array of billed usage by dimension and update the workload's billed cost and usage quantity
-				for _, billedUsage := range billedUsageByDimension {
-					workloadCost, costExists := workloadCostMap[workload]
-					if !costExists {
-						workloadCostMap[workload] = createAwsCustomCost(billedUsage.BilledCost, billedUsage.UsageQuantityGB, resourceName)
-					} else {
-						workloadCost.BilledCost += billedUsage.BilledCost
-						workloadCost.UsageQuantity += billedUsage.UsageQuantityGB
-
-						workloadCostMap[workload] = workloadCost
-					}
-				}
-			}
+		// loop through products that matched given filter and retrieve pricing data
+		priceDimensions, err := getSortedPriceDimensionsFromProducts(internetProducts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get price dimensions from products: %v", err)
 		}
+
+		return priceDimensions, nil
+	} else {
+		// for regions with no API data currently available, we will use the pricing given on their website by default
+		var priceDimensions []networkplugin.PriceDimension
+
+		// create and append each pricing tier
+		freePriceDimension := getPriceDimensionFromValues("0", "1", "0.0000000000")
+		first10TBPriceDimension := getPriceDimensionFromValues("1", "10240", "0.1500000000")
+		next40TBPriceDimension := getPriceDimensionFromValues("10240", "51200", "0.1380000000")
+		next100TBPriceDimension := getPriceDimensionFromValues("51200", "153600", "0.1260000000")
+		over150TBPriceDimension := getPriceDimensionFromValues("153600", "Inf", "0.1140000000")
+
+		priceDimensions = append(priceDimensions, freePriceDimension)
+		priceDimensions = append(priceDimensions, first10TBPriceDimension)
+		priceDimensions = append(priceDimensions, next40TBPriceDimension)
+		priceDimensions = append(priceDimensions, next100TBPriceDimension)
+		priceDimensions = append(priceDimensions, over150TBPriceDimension)
+
+		return priceDimensions, nil
 	}
-
-	// convert workload cost map to array and return
-	var workloadCostArray []*pb.CustomCost
-	for _, cost := range workloadCostMap {
-		workloadCostArray = append(workloadCostArray, cost)
-	}
-
-	return workloadCostArray, totalBilledUsageBytes, nil
 }
 
-func calculateBilledUsageAcrossPricingDimensions(
+func getPriceDimensionFromValues(beginRange string, endRange string, pricePerUnit string) networkplugin.PriceDimension {
+	return networkplugin.PriceDimension{
+		BeginRange: beginRange,
+		EndRange:   endRange,
+		PricePerUnit: networkplugin.PricePerUnit{
+			USD: pricePerUnit,
+		},
+	}
+}
+
+func getSortedPriceDimensionsFromProducts(products *pricing.GetProductsOutput) ([]networkplugin.PriceDimension, error) {
+	var priceDimensions []networkplugin.PriceDimension
+
+	for _, interzonePricingJson := range products.PriceList {
+
+		// marshal pricing data JSON into a structure
+		var interzonePricingData networkplugin.ProductPrice
+		if err := json.Unmarshal([]byte(interzonePricingJson), &interzonePricingData); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal inter-zone network pricing entry: %v", err)
+		}
+
+		// navigate through pricing data structure to get price dimensions
+		for _, term := range interzonePricingData.Terms.OnDemand {
+			if len(priceDimensions) != 0 {
+				log.Warnf("unexpected inter-zone network pricing term found. skipping... term: %v", term)
+				continue
+			}
+
+			for _, dimension := range term.PriceDimensions {
+				priceDimensions = append(priceDimensions, dimension)
+			}
+		}
+
+		// sort price dimensions by range
+		sort.Slice(priceDimensions, func(i, j int) bool {
+			beginI, _ := strconv.Atoi(priceDimensions[i].BeginRange)
+			beginJ, _ := strconv.Atoi(priceDimensions[j].BeginRange)
+			return beginI < beginJ
+		})
+	}
+
+	return priceDimensions, nil
+}
+
+func calculateBilledUsageAcrossPriceDimensions(
 	totalBilledUsageBytes int64,
 	usagePendingBillingBytes int64,
 	priceDimensions []networkplugin.PriceDimension,
@@ -349,6 +359,107 @@ func createAwsCustomCost(billedCost float32, usageQuantity float32, resourceName
 		// ProviderId:    fmt.Sprintf("%s/%s/%s", billingEntry.OrganizationID, billingEntry.ProjectID, billingEntry.Name)
 		// UsageUnit:      "tokens - All snapshots, all projects",
 	}
+}
+
+func calculateCostFromSampleStream(stream *model.SampleStream) {
+
+}
+
+func calculateAwsInterZoneCosts(
+	resourceName string,
+	resultsMatrix model.Matrix,
+	priceDimensions []networkplugin.PriceDimension,
+	totalBilledUsageBytes int64,
+) (costs []*pb.CustomCost, updatedTotalBilledUsageBytes int64, err error) {
+	// create a map to store costs by workload
+	workloadCostMap := make(map[networkplugin.Workload]*pb.CustomCost)
+
+	// loop through data matrices and calculate the cost at the correct pricing tier
+	for _, stream := range resultsMatrix {
+		// if any labels are missing, we cannot evaluate this data and skip it
+		srcZone, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_SRC_ZONE]
+		if !ok {
+			continue
+		}
+
+		dstZone, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_DST_ZONE]
+		if !ok {
+			continue
+		}
+
+		// if the data transferred between two different zones, we need to bill this data
+		if srcZone != dstZone {
+			for i, val := range stream.Values {
+				if i > 0 {
+					log.Warnf("prometheus query returned data for additional step when only 1 was expected: %v", val)
+					continue
+				}
+
+				// get source owner name and type to map cost to workload
+				srcOwnerName, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_SRC_OWNER_NAME]
+				if !ok {
+					log.Warnf("prometheus data is missing label: %s", networkplugin.PROMETHEUS_LABEL_SRC_OWNER_NAME)
+				}
+
+				srcOwnerType, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_SRC_OWNER_TYPE]
+				if !ok {
+					log.Warnf("prometheus data is missing label: %s", networkplugin.PROMETHEUS_LABEL_SRC_OWNER_NAME)
+				}
+
+				// calculate inter-zone cost for each relevant pricing dimension
+				usagePendingBilling := int64(val.Value)
+				billedUsageByDimension, updatedTotalBilledUsageBytes, err := calculateBilledUsageAcrossPriceDimensions(
+					totalBilledUsageBytes,
+					usagePendingBilling,
+					priceDimensions,
+				)
+				if err != nil {
+					log.Errorf("failed to calculate AWS inter-zone cost for workload %v/%v: %v", err, srcOwnerType, srcOwnerName)
+					break
+				}
+
+				// after cost calculation, the total billed amount must be updated as well
+				totalBilledUsageBytes = updatedTotalBilledUsageBytes
+
+				// if workload already exists in map, add to existing workload cost
+				// otherwise, create new cost associated with workload
+				workload := networkplugin.Workload{
+					Name: string(srcOwnerName),
+					Type: string(srcOwnerType),
+				}
+
+				// loop through the array of billed usage by dimension and update the workload's billed cost and usage quantity
+				for _, billedUsage := range billedUsageByDimension {
+					workloadCost, costExists := workloadCostMap[workload]
+					if !costExists {
+						workloadCostMap[workload] = createAwsCustomCost(billedUsage.BilledCost, billedUsage.UsageQuantityGB, resourceName)
+					} else {
+						workloadCost.BilledCost += billedUsage.BilledCost
+						workloadCost.UsageQuantity += billedUsage.UsageQuantityGB
+
+						workloadCostMap[workload] = workloadCost
+					}
+				}
+			}
+		}
+	}
+
+	// convert workload cost map to array and return
+	var workloadCostArray []*pb.CustomCost
+	for _, cost := range workloadCostMap {
+		workloadCostArray = append(workloadCostArray, cost)
+	}
+
+	return workloadCostArray, totalBilledUsageBytes, nil
+}
+
+func calculateAwsInternetCosts(
+	resourceName string,
+	resultsMatrix model.Matrix,
+	priceDimensions []networkplugin.PriceDimension,
+	totalBilledUsageBytes int64,
+) ([]*pb.CustomCost, error) {
+
 }
 
 func getAwsRegionalUsageTypeFromRegion(region string) string {

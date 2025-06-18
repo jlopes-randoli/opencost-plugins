@@ -11,6 +11,7 @@ const PROMETHEUS_LABEL_SRC_OWNER_TYPE = "SrcK8S_OwnerType"
 
 const QUERY_WORKLOAD_INGRESS_BYTES_TOTAL = "increase(netobserv_workload_ingress_bytes_total[%s])"
 const QUERY_WORKLOAD_EGRESS_BYTES_TOTAL = "increase(netobserv_workload_egress_bytes_total[%s])"
+const QUERY_CLUSTER_EXTERNAL_EGRESS_BYTES_TOTAL = "increase(netobserv_cluster_external_egress_bytes_total[%s])"
 
 // AWS
 const AWS_CONFIG_REGION = "us-east-1"
@@ -71,3 +72,5 @@ const AWS_USAGE_TYPE_REGIONAL_ASIA_PACIFIC_NORTH_EAST_1 = "APN1-DataTransfer-Reg
 const AWS_USAGE_TYPE_REGIONAL_ASIA_PACIFIC_NORTH_EAST_2 = "APN2-DataTransfer-Regional-Bytes"
 const AWS_USAGE_TYPE_REGIONAL_ASIA_PACIFIC_SOUTH_EAST_1 = "APS1-DataTransfer-Regional-Bytes"
 const AWS_USAGE_TYPE_REGIONAL_ASIA_PACIFIC_SOUTH_EAST_2 = "APS2-DataTransfer-Regional-Bytes"
+
+const AWS_USAGE_TYPE_INTERNET_SOUTH_AMERICA_EAST_1 = "SAE1-DataTransfer-Out-Bytes"

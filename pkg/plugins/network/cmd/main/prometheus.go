@@ -12,7 +12,7 @@ import (
 	"github.com/prometheus/common/model"
 )
 
-func (s *NetworkCostSource) getSumOfInterZoneDataSinceBillingPeriodStart(req *pb.CustomCostRequest, query string) (sum int64, err error) {
+func (s *NetworkCostSource) getSumOfInterZoneDataSinceBillingPeriodStart(req *pb.CustomCostRequest, query string) (int64, error) {
 	// create a range between the start of the billing period and the start of the request query range
 	start := getBillingPeriodStartDate(req.Start.AsTime(), s.billingPeriodStartDate)
 	end := req.Start.AsTime()
@@ -29,7 +29,61 @@ func (s *NetworkCostSource) getSumOfInterZoneDataSinceBillingPeriodStart(req *pb
 		return 0, err
 	}
 
-	return getInterZoneBytesSumFromPrometheusResults(results), nil
+	// loop through the given results and sum all bytes that are confirmed as inter-zone data transfer
+	var sum int64
+	matrix := results.(model.Matrix)
+
+	for _, stream := range matrix {
+		// if any labels are missing, we cannot evaluate this data and skip it
+		srcZone, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_SRC_ZONE]
+		if !ok {
+			continue
+		}
+
+		dstZone, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_DST_ZONE]
+		if !ok {
+			continue
+		}
+
+		// if the data transferred between two different zones, then we need to add these bytes to the sum
+		if srcZone != dstZone {
+			for _, val := range stream.Values {
+				sum += int64(val.Value)
+			}
+		}
+	}
+
+	return sum, nil
+}
+
+func (s *NetworkCostSource) getSumOfInternetDataSinceBillingPeriodStart(req *pb.CustomCostRequest) (int64, error) {
+	// create a range between the start of the billing period and the start of the request query range
+	start := getBillingPeriodStartDate(req.Start.AsTime(), s.billingPeriodStartDate)
+	end := req.Start.AsTime()
+	step := req.Resolution.AsDuration()
+
+	// if billing period starts on the same day as the query, there is no previous data to get
+	if start.Equal(end) {
+		return 0, nil
+	}
+
+	// query the Prometheus API for cluster internet bytes within the given range
+	results, err := s.queryPrometheusData(networkplugin.QUERY_CLUSTER_EXTERNAL_EGRESS_BYTES_TOTAL, start, end, step)
+	if err != nil {
+		return 0, err
+	}
+
+	// loop through the given results and sum all bytes
+	var sum int64
+	matrix := results.(model.Matrix)
+
+	for _, stream := range matrix {
+		for _, val := range stream.Values {
+			sum += int64(val.Value)
+		}
+	}
+
+	return sum, nil
 }
 
 func (s *NetworkCostSource) queryPrometheusData(query string, start time.Time, end time.Time, step time.Duration) (model.Value, error) {
@@ -55,32 +109,4 @@ func (s *NetworkCostSource) queryPrometheusData(query string, start time.Time, e
 	}
 
 	return results, nil
-}
-
-func getInterZoneBytesSumFromPrometheusResults(results model.Value) int64 {
-	// loop through the given results and sum all bytes that are confirmed as inter-zone data transfer
-	var sum int64
-
-	matrix := results.(model.Matrix)
-	for _, stream := range matrix {
-		// if any labels are missing, we cannot evaluate this data and skip it
-		srcZone, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_SRC_ZONE]
-		if !ok {
-			continue
-		}
-
-		dstZone, ok := stream.Metric[networkplugin.PROMETHEUS_LABEL_DST_ZONE]
-		if !ok {
-			continue
-		}
-
-		// if the data transferred between two different zones, then we need to add these bytes to the sum
-		if srcZone != dstZone {
-			for _, val := range stream.Values {
-				sum += int64(val.Value)
-			}
-		}
-	}
-
-	return sum
 }
